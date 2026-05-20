@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Web Speed Test（グラフ付き）</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+    body { font-family: Arial; padding: 20px; }
+    #result { margin-top: 20px; font-size: 18px; }
+</style>
+</head>
+<body>
+
+<h2>Web Speed Test（グラフ付き）</h2>
+<button onclick="runTest()">計測開始</button>
+<p id="result">結果がここに表示されます</p>
+
+<canvas id="speedChart" width="400" height="200"></canvas>
+
+<script>
+async function pingTest() {
+    const start = performance.now();
+    await fetch("https://1.1.1.1/cdn-cgi/trace", { cache: "no-store" });
+    return (performance.now() - start).toFixed(2);
+}
+
+async function downloadTest() {
+    let totalBytes = 0;
+    const start = performance.now();
+
+    for (let i = 0; i < 5; i++) {
+        const res = await fetch("https://speed.cloudflare.com/__down?bytes=1000000");
+        const blob = await res.blob();
+        totalBytes += blob.size;
+    }
+
+    const end = performance.now();
+    return ((totalBytes * 8 / 1_000_000) / ((end - start) / 1000)).toFixed(2);
+}
+
+async function uploadTest() {
+    const data = new Uint8Array(1 * 1024 * 1024);
+    let totalBytes = 0;
+    const start = performance.now();
+
+    for (let i = 0; i < 5; i++) {
+        await fetch("https://speed.cloudflare.com/__up", {
+            method: "POST",
+            body: data
+        });
+        totalBytes += data.length;
+    }
+
+    const end = performance.now();
+    return ((totalBytes * 8 / 1_000_000) / ((end - start) / 1000)).toFixed(2);
+}
+
+let chart = null;
+
+async function runTest() {
+    document.getElementById("result").textContent = "計測中…";
+
+    const ping = await pingTest();
+    const down = await downloadTest();
+    const up = await uploadTest();
+
+    document.getElementById("result").textContent =
+        `Ping: ${ping} ms / Download: ${down} Mbps / Upload: ${up} Mbps`;
+
+    drawGraph(ping, down, up);
+}
+
+function drawGraph(ping, down, up) {
+    const ctx = document.getElementById("speedChart");
+
+    if (chart) chart.destroy();
+
+    chart = new Chart(ctx, {
+        type: "bar",
+        data: {
+            labels: ["Ping (ms)", "Download (Mbps)", "Upload (Mbps)"],
+            datasets: [{
+                label: "速度結果",
+                data: [ping, down, up],
+                backgroundColor: ["#3498db", "#2ecc71", "#e67e22"]
+            }]
+        },
+        options: {
+            scales: {
+                y: { beginAtZero: true }
+            }
+        }
+    });
+}
+</script>
+
+</body>
+</html>
