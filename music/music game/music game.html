@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>4-Lane Rhythm Game - 修正版</title>
+<style>
+  :root{
+    --bg:#111; --panel:#222; --accent:#0af; --hit:#ff3b3b; --text:#fff;
+  }
+  html,body{height:100%;margin:0;}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family: "Helvetica Neue", Arial, "Noto Sans JP", sans-serif;
+    display:flex; flex-direction:column; align-items:center; padding:16px; box-sizing:border-box;
+  }
+  h1{margin:6px 0 12px 0;font-size:20px;}
+
+  .controls{width:420px; display:flex; gap:8px; align-items:center; margin-bottom:10px;}
+  input[type=file]{color:#fff;}
+  audio{width:220px;}
+
+  #game{
+    width:400px; height:500px; border:2px solid #fff; position:relative; overflow:hidden; display:flex;
+    background:linear-gradient(180deg,#0b0b0b,#111);
+  }
+  .lane{flex:1; border-left:1px solid #444; border-right:1px solid #444; position:relative; box-sizing:border-box;}
+  .hit-line{width:100%; height:5px; background:var(--hit); position:absolute; bottom:80px; left:0;}
+  .note{
+    width:80%; height:18px; background:var(--accent); position:absolute; left:10%; border-radius:4px;
+    box-shadow:0 2px 6px rgba(0,0,0,0.6); will-change: transform, opacity; pointer-events:none;
+    transform: translateY(-20px);
+  }
+
+  .status{width:400px; display:flex; justify-content:space-between; margin-top:10px; gap:8px;}
+  #score,#combo{font-size:16px;}
+  #judge{font-size:28px; height:36px; margin-top:6px; opacity:0; transition:opacity .12s linear; will-change:opacity;}
+
+  .key-labels{display:flex; width:400px; margin-top:8px; justify-content:space-between;}
+  .key-labels div{width:25%; text-align:center; color:#ddd; font-weight:700; padding:6px 0; user-select:none;}
+  .key-labels .active{color:#000; background:var(--accent); border-radius:6px; box-shadow:0 2px 6px rgba(0,0,0,0.5) inset;}
+
+  @media (max-width:460px){
+    #game, .status, .key-labels, .controls{width:95%;}
+    audio{width:160px;}
+  }
+</style>
+</head>
+<body>
+
+<h1>4-Lane Rhythm Game</h1>
+
+<div class="controls">
+  <input type="file" id="fileInput" accept="audio/*">
+  <audio id="audio" controls></audio>
+  <div style="margin-left:6px;"><div id="bpmText">BPM: ---</div></div>
+  <button id="startGame" disabled style="margin-left:auto;">ゲーム開始</button>
+</div>
+
+<div class="status">
+  <div id="score">Score: 0</div>
+  <div id="combo">Combo: 0</div>
+  <div id="judge" aria-live="polite"></div>
+</div>
+
+<div id="game" aria-hidden="false">
+  <div class="lane" data-lane="0"><div class="hit-line"></div></div>
+  <div class="lane" data-lane="1"><div class="hit-line"></div></div>
+  <div class="lane" data-lane="2"><div class="hit-line"></div></div>
+  <div class="lane" data-lane="3"><div class="hit-line"></div></div>
+</div>
+
+<div class="key-labels" aria-hidden="false">
+  <div id="keyF">F</div>
+  <div id="keyG">G</div>
+  <div id="keyJ">J</div>
+  <div id="keyK">K</div>
+</div>
+
+<script>
+/* ---------- グローバル ---------- */
+const fileInput = document.getElementById("fileInput");
+const audio = document.getElementById("audio");
+const bpmText = document.getElementById("bpmText");
+const startBtn = document.getElementById("startGame");
+const scoreElem = document.getElementById("score");
+const comboElem = document.getElementById("combo");
+const judgeElem = document.getElementById("judge");
+const keyF = document.getElementById("keyF");
+const keyG = document.getElementById("keyG");
+const keyJ = document.getElementById("keyJ");
+const keyK = document.getElementById("keyK");
+
+let bpm = 0;
+let notes = [];           // {time(ms), lane, spawned}
+let activeNotes = [];     // {el, lane}
+let laneMap = {};
+let gameStarted = false;
+let startTime = 0;
+let lastFrameTime = 0;
+let score = 0;
+let combo = 0;
+let judgeTimer = null;
+
+/* ---------- DOM 準備後にレーンマップを作る ---------- */
+function buildLaneMap(){
+  laneMap = {};
+  document.querySelectorAll(".lane").forEach(l => {
+    laneMap[String(l.dataset.lane)] = l;
+  });
+}
+window.addEventListener("DOMContentLoaded", buildLaneMap);
+window.addEventListener("resize", buildLaneMap);
+
+/* ---------- 簡易 BPM 推定（既存ロジック） ---------- */
+async function detectBPM(audioBuffer) {
+  const sampleRate = audioBuffer.sampleRate;
+  const data = audioBuffer.getChannelData(0);
+  const length = Math.min(sampleRate * 30, data.length);
+  const buf = new Float32Array(length);
+  let max = 0;
+  for (let i = 0; i < length; i++) {
+    const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (length - 1));
+    buf[i] = data[i] * w;
+    if (Math.abs(buf[i]) > max) max = Math.abs(buf[i]);
+  }
+  if (max > 0) for (let i = 0; i < length; i++) buf[i] /= max;
+  const minBPM = 60, maxBPM = 200;
+  const minLag = Math.floor(sampleRate * 60 / maxBPM);
+  const maxLag = Math.floor(sampleRate * 60 / minBPM);
+  let bestLag = 0, bestCorr = 0;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let sum = 0;
+    for (let i = 0; i < length - lag; i++) sum += buf[i] * buf[i + lag];
+    if (sum > bestCorr) { bestCorr = sum; bestLag = lag; }
+  }
+  return bestLag ? Math.round(60 * sampleRate / bestLag) : 0;
+}
+
+/* ---------- ファイル読み込み ---------- */
+fileInput.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  audio.src = URL.createObjectURL(file);
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const array = await file.arrayBuffer();
+    const audioBuffer = await ctx.decodeAudioData(array);
+    bpm = await detectBPM(audioBuffer);
+    bpmText.textContent = "BPM: " + (bpm || "---");
+    generateChart(bpm || 120, audioBuffer.duration);
+    startBtn.disabled = false;
+  } catch (err) {
+    console.error("音声解析エラー:", err);
+    bpmText.textContent = "BPM: ---";
+    generateChart(120, 120); // デフォルトで短い譜面を作る
+    startBtn.disabled = false;
+  }
+});
+
+/* ---------- 譜面生成 ---------- */
+function generateChart(bpmValue, durationSec) {
+  notes = [];
+  const beatMs = 60000 / bpmValue;
+  const totalMs = Math.max(0, durationSec * 1000);
+  for (let t = 1000; t < totalMs - 1000; t += beatMs) {
+    notes.push({ time: Math.round(t), lane: Math.floor(Math.random() * 4), spawned: false });
+  }
+  console.log("notes:", notes.length, "bpm:", bpmValue);
+}
+
+/* ---------- ゲーム開始 ---------- */
+startBtn.addEventListener("click", () => {
+  if (gameStarted) return;
+  gameStarted = true;
+  startBtn.disabled = true;
+  score = 0; combo = 0; updateScore(); updateCombo();
+  // 既存ノーツ削除
+  activeNotes.forEach(n => n.el.remove());
+  activeNotes = [];
+  // 再生（ユーザー操作直後）
+  audio.currentTime = 0;
+  audio.play().catch(err => console.warn("play blocked:", err));
+  startTime = performance.now();
+  lastFrameTime = startTime;
+  requestAnimationFrame(loop);
+});
+
+/* ---------- メインループ（Δt ベース） ---------- */
+const HIT_LINE_Y = null; // 動的に計算する（下で取得）
+
+function getHitLineY(){
+  // hit-line の位置を計算（最初のレーンの hit-line を参照）
+  const lane = document.querySelector(".lane");
+  if (!lane) return 500 - 80;
+  const hit = lane.querySelector(".hit-line");
+  if (!hit) return 500 - 80;
+  const rect = hit.getBoundingClientRect();
+  const parentRect = document.getElementById("game").getBoundingClientRect();
+  // hit の top relative to game top
+  return rect.top - parentRect.top + rect.height/2;
+}
+
+function loop(now){
+  const elapsed = now - startTime;
+  const dt = now - lastFrameTime; // ms since last frame
+  lastFrameTime = now;
+
+  // spawn: ノーツ判定時刻の1.5秒前に出す
+  for (let i = 0; i < notes.length; i++){
+    const n = notes[i];
+    if (!n.spawned && elapsed >= n.time - 1500){
+      spawnNote(n);
+      n.spawned = true;
+    }
+  }
+
+  // 移動: 時間ベースで速度を計算（px/sec）
+  // ここでは speedPxPerSec を固定にしているが BPM に合わせることも可能
+  const speedPxPerSec = 180; // 180 px / sec
+  const dy = (speedPxPerSec * dt) / 1000; // px this frame
+
+  // 動的に判定ラインYを取得（最初のフレームで）
+  const hitY = getHitLineY();
+
+  for (let i = activeNotes.length - 1; i >= 0; i--){
+    const obj = activeNotes[i];
+    let y = parseFloat(obj.el.dataset.y);
+    if (isNaN(y)) y = -20; // ガード
+    y += dy;
+    obj.el.dataset.y = String(y);
+    // transform を使って描画（top より高速）
+    obj.el.style.transform = `translateY(${y}px)`;
+
+    // MISS 判定（hitY が null の場合は既定値）
+    const effectiveHitY = (typeof hitY === "number" && !isNaN(hitY)) ? hitY : (500 - 80);
+    if (y > effectiveHitY + 120) {
+      obj.el.remove();
+      activeNotes.splice(i,1);
+      combo = 0; updateCombo(); showJudge("MISS","red");
+    }
+  }
+
+  requestAnimationFrame(loop);
+}
+
+/* ---------- spawnNote（必ず style と dataset を設定） ---------- */
+function spawnNote(n){
+  const laneElem = laneMap[String(n.lane)];
+  if (!laneElem) {
+    console.warn("invalid lane", n.lane);
+    return;
+  }
+  const note = document.createElement("div");
+  note.className = "note";
+  note.dataset.y = "-20";
+  note.style.transform = `translateY(-20px)`;
+  laneElem.appendChild(note);
+  activeNotes.push({ el: note, lane: n.lane });
+}
+
+/* ---------- 判定（キー入力） ---------- */
+const keyToLane = { KeyF:0, KeyG:1, KeyJ:2, KeyK:3 };
+window.addEventListener("keydown", (e) => {
+  if (!(e.code in keyToLane)) return;
+  if (!gameStarted) return;
+  const lane = keyToLane[e.code];
+  flashKey(e.code);
+
+  // 最も近いノーツを探す（同レーン）
+  let best = null, bestDiff = Infinity;
+  const hitY = getHitLineY();
+  for (let i = 0; i < activeNotes.length; i++){
+    const obj = activeNotes[i];
+    if (String(obj.lane) !== String(lane)) continue;
+    let y = parseFloat(obj.el.dataset.y);
+    if (isNaN(y)) y = -20;
+    const diff = Math.abs(y - hitY);
+    if (diff < bestDiff){ bestDiff = diff; best = {obj, idx:i}; }
+  }
+
+  if (!best){
+    combo = 0; updateCombo(); showJudge("MISS","red"); return;
+  }
+
+  // 判定幅（px）
+  if (bestDiff < 10) { score += 1000; combo++; showJudge("PERFECT","#ffea00"); }
+  else if (bestDiff < 25) { score += 500; combo++; showJudge("GREAT","#0f0"); }
+  else if (bestDiff < 40) { score += 200; combo = 0; showJudge("GOOD","#0af"); }
+  else { combo = 0; showJudge("MISS","red"); }
+
+  updateScore(); updateCombo();
+
+  // ノーツ削除
+  const idx = best.idx;
+  best.obj.el.remove();
+  activeNotes.splice(idx,1);
+});
+
+/* ---------- キー表示フィードバック ---------- */
+function flashKey(code){
+  let el = null;
+  if (code === "KeyF") el = keyF;
+  if (code === "KeyG") el = keyG;
+  if (code === "KeyJ") el = keyJ;
+  if (code === "KeyK") el = keyK;
+  if (!el) return;
+  el.classList.add("active");
+  setTimeout(()=> el.classList.remove("active"), 120);
+}
+
+/* ---------- UI 更新 / 判定表示 ---------- */
+function updateScore(){ scoreElem.textContent = "Score: " + score; }
+function updateCombo(){ comboElem.textContent = "Combo: " + combo; }
+
+function showJudge(text, color){
+  // opacity を一旦 0 にしてから差し替え、次フレームで 1 にする（レイアウト揺れ防止）
+  judgeElem.style.opacity = 0;
+  judgeElem.style.color = color;
+  judgeElem.textContent = text;
+  requestAnimationFrame(()=> judgeElem.style.opacity = 1);
+  clearTimeout(judgeTimer);
+  judgeTimer = setTimeout(()=> judgeElem.style.opacity = 0, 150);
+}
+
+/* ---------- デバッグ用: コンソールからノーツを追加 ---------- */
+window._debugSpawn = function(laneIndex = 0){
+  const t = (performance.now() - startTime) + 1500;
+  notes.push({ time: Math.round(t), lane: laneIndex, spawned:false });
+  console.log("debug spawn queued at", t, "lane", laneIndex);
+};
+</script>
+
+</body>
+</html>
